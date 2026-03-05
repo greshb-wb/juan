@@ -38,6 +38,15 @@ pub async fn handle_event(
         files,
     } = event;
 
+    // Strip bot mention prefix (e.g. "<@U12345> ") so @mentions don't break command parsing
+    let text = if let Some(rest) = text.trim_start().strip_prefix("<@") {
+        rest.find('>')
+            .map(|i| rest[i + 1..].trim_start().to_string())
+            .unwrap_or(text)
+    } else {
+        text
+    };
+
     // Check if this is a response to a pending permission request FIRST
     let thread_key = thread_ts.as_deref().unwrap_or(&ts);
     debug!(
@@ -86,6 +95,7 @@ pub async fn handle_event(
         &text,
         &files,
         &channel,
+        &ts,
         thread_ts.as_deref(),
         slack,
         agent_manager,

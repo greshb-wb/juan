@@ -531,10 +531,18 @@ async fn handle_push_event(
                 return Ok(());
             }
 
+            // In channels (non-DM), only respond to thread replies (existing sessions).
+            // New messages in channels require @mention (handled by AppMention event).
+            let channel_id = msg.origin.channel.as_ref().map(|c| c.to_string()).unwrap_or_default();
+            let is_dm = channel_id.starts_with('D');
+            if !is_dm && msg.origin.thread_ts.is_none() {
+                trace!("Ignoring non-threaded channel message, use @mention instead");
+                return Ok(());
+            }
+
             if let Some(content) = msg.content {
                 let text = content.text.unwrap_or_default();
                 let files = content.files.unwrap_or_default();
-                // Decode Slack text formatting
                 let text = decode_slack_text(&text);
                 let user = msg.sender.user.map(|u| u.to_string()).unwrap_or_default();
                 debug!(
@@ -543,13 +551,8 @@ async fn handle_push_event(
                     msg.origin.channel,
                     files.len()
                 );
-                // Convert to SlackEvent and send to channel
                 let _ = tx.send(SlackEvent {
-                    channel: msg
-                        .origin
-                        .channel
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
+                    channel: channel_id,
                     ts: msg.origin.ts.to_string(),
                     thread_ts: msg.origin.thread_ts.map(|ts| ts.to_string()),
                     text,

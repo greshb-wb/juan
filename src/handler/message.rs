@@ -12,12 +12,15 @@ pub async fn handle_message(
     text: &str,
     files: &[slack_morphism::prelude::SlackFile],
     channel: &str,
+    ts: &str,
     thread_ts: Option<&str>,
     slack: Arc<slack::SlackConnection>,
     agent_manager: Arc<agent::AgentManager>,
     session_manager: Arc<session::SessionManager>,
     notification_tx: tokio::sync::mpsc::UnboundedSender<bridge::NotificationWrapper>,
 ) {
+    // Always reply in a thread
+    let thread_ts = Some(thread_ts.unwrap_or(ts));
     let thread_key = thread_ts.unwrap_or(channel);
     debug!(
         "Handling message in thread_key={}, text_len={}",

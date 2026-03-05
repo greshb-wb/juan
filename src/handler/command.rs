@@ -32,11 +32,15 @@ pub async fn handle_command(
     let parts: Vec<&str> = text.trim().split_whitespace().collect();
     let command = parts[0];
 
+    // Always reply in a thread: if not already in a thread, use the message's own ts
+    let in_thread = thread_ts.is_some();
+    let thread_ts = Some(thread_ts.unwrap_or(ts));
+
     match command {
         "#new" => {
             debug!("Processing #new command: parts={:?}", parts);
             // Can only create sessions in main channel, not in existing threads
-            if thread_ts.is_some() {
+            if in_thread {
                 let _ = slack
                     .send_message(
                         channel,
