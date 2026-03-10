@@ -47,7 +47,10 @@ pub async fn handle_event(
             .send_message(
                 &channel,
                 thread_ts.as_deref().or(Some(&ts)),
-                &format!("⛔ Sorry <@{}>, you don't have permission to use this bot.", user),
+                &format!(
+                    "⛔ Sorry <@{}>, you don't have permission to use this bot.",
+                    user
+                ),
             )
             .await;
         return;
