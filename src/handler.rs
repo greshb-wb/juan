@@ -15,7 +15,7 @@ use crate::{
     slack::{SlackConnection, SlackEvent},
 };
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Main entry point for handling Slack events.
 /// Routes events to appropriate handlers based on message content.
@@ -42,7 +42,7 @@ pub async fn handle_event(
     // Check user permission
     let allowed = &config.bridge.allowed_users;
     if !allowed.is_empty() && !allowed.contains(&user) {
-        debug!("User {} is not in allowed_users, ignoring message", user);
+        info!("User {} is not in allowed_users, ignoring message", user);
         let _ = slack
             .send_message(
                 &channel,
