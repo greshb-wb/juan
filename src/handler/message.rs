@@ -29,13 +29,11 @@ pub async fn handle_message(
     );
     trace!("Message text: {}", text);
 
-    // Verify session exists for this thread
+    // Verify session exists for this thread — silently ignore if not
     let session = match session_manager.get_session(thread_key).await {
         Some(s) => s,
         None => {
-            let _ = slack
-                .send_message(channel, thread_ts, "No active session. Use #help for help.")
-                .await;
+            debug!("No active session for thread_key={}, ignoring", thread_key);
             return;
         }
     };
