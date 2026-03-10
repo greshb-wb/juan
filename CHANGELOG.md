@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `#new` command now uses `--` as separator for comments: `#new <agent> [workspace] [-- <comment>]`
+- Log output now uses local timestamps instead of UTC
 
 ## [0.5.0] - 2026-03-07
 

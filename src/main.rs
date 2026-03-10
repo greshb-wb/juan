@@ -11,6 +11,7 @@ mod bridge;
 mod cli;
 mod config;
 mod handler;
+mod log_timer;
 mod session;
 mod slack;
 mod utils;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::bridge::run_bridge;
+use crate::log_timer::Iso8601Timer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,12 +33,10 @@ async fn main() -> Result<()> {
             return config::Config::init(&config, r#override);
         }
         cli::Command::Run { config, log_level } => {
-            // Initialize logging with the specified level and local timestamps
-            let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339()
-                .expect("Failed to get local time offset");
+            // Initialize logging with ISO 8601 local timestamps
             tracing_subscriber::fmt()
                 .with_env_filter(log_level)
-                .with_timer(timer)
+                .with_timer(Iso8601Timer)
                 .init();
 
             info!("Loading configuration from: {}", config);
