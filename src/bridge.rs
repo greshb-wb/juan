@@ -20,8 +20,6 @@ pub type MessageBuffers = Arc<RwLock<HashMap<SessionId, String>>>;
 struct ToolSummary {
     /// Slack channel
     channel: String,
-    /// Slack thread key
-    thread_key: String,
     /// Timestamp of the summary message in Slack
     message_ts: String,
     /// Total tool calls started
@@ -72,7 +70,7 @@ impl ToolSummary {
 }
 
 /// Shared map of session_id -> active tool summary
-pub type ToolSummaries = Arc<RwLock<HashMap<SessionId, ToolSummary>>>;
+type ToolSummaries = Arc<RwLock<HashMap<SessionId, ToolSummary>>>;
 
 /// Shared map for tracking pending permission requests
 pub type PendingPermissions = Arc<
@@ -322,7 +320,6 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                                     // Create new summary message
                                     let mut summary = ToolSummary {
                                         channel: session.channel.clone(),
-                                        thread_key: thread_key.clone(),
                                         message_ts: String::new(),
                                         call_count: 1,
                                         completed_count: 0,
