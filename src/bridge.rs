@@ -23,8 +23,6 @@ pub type ThoughtBuffers = Arc<RwLock<HashMap<SessionId, String>>>;
 struct ToolSummary {
     /// Slack channel
     channel: String,
-    /// Slack thread key
-    thread_key: String,
     /// Timestamp of the summary message in Slack
     message_ts: String,
     /// Total tool calls started
@@ -49,7 +47,11 @@ impl ToolSummary {
         let finished = self.completed_count + self.failed_count;
         if finished == self.call_count && self.call_count > 0 {
             // All done
-            let emoji = if self.failed_count > 0 { "⚠️" } else { "✅" };
+            let emoji = if self.failed_count > 0 {
+                "⚠️"
+            } else {
+                "✅"
+            };
             format!(
                 "{} {} tool call{} ({}){}",
                 emoji,
@@ -148,12 +150,8 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
 
                     if let Some((thread_key, session)) = session_info {
                         // Finalize any active tool summary
-                        finalize_tool_summary(
-                            &tool_summaries_clone,
-                            &session_id,
-                            &slack_clone,
-                        )
-                        .await;
+                        finalize_tool_summary(&tool_summaries_clone, &session_id, &slack_clone)
+                            .await;
 
                         flush_message_buffer(
                             &buffers_clone,
@@ -213,21 +211,6 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                                 &slack_clone,
                                 &session.channel,
                                 &thread_key,
-                            )
-                            .await;
-                        }
-
-                        // Finalize tool summary when a non-tool event arrives
-                        let is_tool_event = matches!(
-                            notification.update,
-                            agent_client_protocol::SessionUpdate::ToolCall(_)
-                                | agent_client_protocol::SessionUpdate::ToolCallUpdate(_)
-                        );
-                        if !is_tool_event {
-                            finalize_tool_summary(
-                                &tool_summaries_clone,
-                                &notification.session_id,
-                                &slack_clone,
                             )
                             .await;
                         }
@@ -359,7 +342,6 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                                     // Create new summary message
                                     let mut summary = ToolSummary {
                                         channel: session.channel.clone(),
-                                        thread_key: thread_key.clone(),
                                         message_ts: String::new(),
                                         call_count: 1,
                                         completed_count: 0,
@@ -373,22 +355,28 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                                     {
                                         Ok(ts) => {
                                             summary.message_ts = ts;
-                                            summaries.insert(
-                                                notification.session_id.clone(),
-                                                summary,
-                                            );
+                                            summaries
+                                                .insert(notification.session_id.clone(), summary);
                                         }
                                         Err(e) => {
                                             tracing::error!("Failed to send tool summary: {}", e);
                                         }
                                     }
                                 }
+
+                                // Upload any diffs from the initial ToolCall content
+                                upload_tool_call_diffs(
+                                    &slack_clone,
+                                    &session.channel,
+                                    &thread_key,
+                                    &tool_call.content,
+                                )
+                                .await;
                             }
                             agent_client_protocol::SessionUpdate::ToolCallUpdate(update) => {
                                 trace!(
                                     "ToolCallUpdate: id={}, status={:?}",
-                                    update.tool_call_id,
-                                    update.fields.status,
+                                    update.tool_call_id, update.fields.status,
                                 );
 
                                 // Update summary counts on terminal status
@@ -564,34 +552,11 @@ async fn finalize_tool_summary(
     session_id: &SessionId,
     slack: &slack::SlackConnection,
 ) {
-    if let Some(summary) = summaries.write().await.remove(session_id) {
-        // Force completed state for display
-        let msg = if summary.failed_count > 0 {
-            format!(
-                "⚠️ {} tool call{} ({}) — {} failed",
-                summary.call_count,
-                if summary.call_count != 1 { "s" } else { "" },
-                if summary.tool_names.len() <= 5 {
-                    summary.tool_names.join(", ")
-                } else {
-                    let shown: Vec<_> = summary.tool_names[..4].to_vec();
-                    format!("{}, +{} more", shown.join(", "), summary.tool_names.len() - 4)
-                },
-                summary.failed_count,
-            )
-        } else {
-            format!(
-                "✅ {} tool call{} ({})",
-                summary.call_count,
-                if summary.call_count != 1 { "s" } else { "" },
-                if summary.tool_names.len() <= 5 {
-                    summary.tool_names.join(", ")
-                } else {
-                    let shown: Vec<_> = summary.tool_names[..4].to_vec();
-                    format!("{}, +{} more", shown.join(", "), summary.tool_names.len() - 4)
-                },
-            )
-        };
+    if let Some(mut summary) = summaries.write().await.remove(session_id) {
+        // Force completed state for display by setting completed_count
+        // so that format_message() enters its "All done" branch
+        summary.completed_count = summary.call_count - summary.failed_count;
+        let msg = summary.format_message();
         let _ = slack
             .update_message(&summary.channel, &summary.message_ts, &msg)
             .await;
@@ -624,7 +589,13 @@ async fn upload_tool_call_diffs(
                     .unwrap_or("file")
             );
             if let Err(e) = slack
-                .upload_file(channel, Some(thread_ts), &diff_text, &filename, Some("Diff"))
+                .upload_file(
+                    channel,
+                    Some(thread_ts),
+                    &diff_text,
+                    &filename,
+                    Some("Diff"),
+                )
                 .await
             {
                 tracing::error!("Failed to upload diff file: {}", e);
