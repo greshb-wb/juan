@@ -19,9 +19,63 @@ pub type MessageBuffers = Arc<RwLock<HashMap<SessionId, String>>>;
 /// Shared thought buffer for accumulating agent thought chunks
 pub type ThoughtBuffers = Arc<RwLock<HashMap<SessionId, String>>>;
 
-/// Shared map for tracking tool call message timestamps
-pub type ToolCallMessages =
-    Arc<RwLock<HashMap<String, (String, String, agent_client_protocol::ToolCall)>>>; // tool_call_id -> (channel, ts, tool_call)
+/// Tracks a single summary Slack message for all tool calls in a prompt cycle
+struct ToolSummary {
+    /// Slack channel
+    channel: String,
+    /// Slack thread key
+    thread_key: String,
+    /// Timestamp of the summary message in Slack
+    message_ts: String,
+    /// Total tool calls started
+    call_count: usize,
+    /// Tool calls that completed successfully
+    completed_count: usize,
+    /// Tool calls that failed
+    failed_count: usize,
+    /// Unique tool names seen (for display)
+    tool_names: Vec<String>,
+}
+
+impl ToolSummary {
+    fn format_message(&self) -> String {
+        let names = if self.tool_names.len() <= 5 {
+            self.tool_names.join(", ")
+        } else {
+            let shown: Vec<_> = self.tool_names[..4].to_vec();
+            format!("{}, +{} more", shown.join(", "), self.tool_names.len() - 4)
+        };
+
+        let finished = self.completed_count + self.failed_count;
+        if finished == self.call_count && self.call_count > 0 {
+            // All done
+            let emoji = if self.failed_count > 0 { "⚠️" } else { "✅" };
+            format!(
+                "{} {} tool call{} ({}){}",
+                emoji,
+                self.call_count,
+                if self.call_count != 1 { "s" } else { "" },
+                names,
+                if self.failed_count > 0 {
+                    format!(" — {} failed", self.failed_count)
+                } else {
+                    String::new()
+                },
+            )
+        } else {
+            // Still running
+            format!(
+                "🔧 {} tool call{} ({})…",
+                self.call_count,
+                if self.call_count != 1 { "s" } else { "" },
+                names,
+            )
+        }
+    }
+}
+
+/// Shared map of session_id -> active tool summary
+pub type ToolSummaries = Arc<RwLock<HashMap<SessionId, ToolSummary>>>;
 
 /// Shared map for tracking pending permission requests
 pub type PendingPermissions = Arc<
@@ -72,8 +126,8 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
     let message_buffers: MessageBuffers = Arc::new(RwLock::new(HashMap::new()));
     let thought_buffers: ThoughtBuffers = Arc::new(RwLock::new(HashMap::new()));
 
-    // Create shared map for tracking tool call messages
-    let tool_call_messages: ToolCallMessages = Arc::new(RwLock::new(HashMap::new()));
+    // Create shared tool summary tracker (one summary message per session)
+    let tool_summaries: ToolSummaries = Arc::new(RwLock::new(HashMap::new()));
 
     // Create shared map for tracking pending permission requests
     let pending_permissions: PendingPermissions = Arc::new(RwLock::new(HashMap::new()));
@@ -83,7 +137,7 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
     let session_manager_clone = session_manager.clone();
     let buffers_clone = message_buffers.clone();
     let thought_buffers_clone = thought_buffers.clone();
-    let tool_messages_clone = tool_call_messages.clone();
+    let tool_summaries_clone = tool_summaries.clone();
     tokio::spawn(async move {
         debug!("Agent notification handler started");
 
@@ -93,6 +147,14 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                     let session_info = session_manager_clone.find_by_session_id(&session_id).await;
 
                     if let Some((thread_key, session)) = session_info {
+                        // Finalize any active tool summary
+                        finalize_tool_summary(
+                            &tool_summaries_clone,
+                            &session_id,
+                            &slack_clone,
+                        )
+                        .await;
+
                         flush_message_buffer(
                             &buffers_clone,
                             &session_id,
@@ -151,6 +213,21 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                                 &slack_clone,
                                 &session.channel,
                                 &thread_key,
+                            )
+                            .await;
+                        }
+
+                        // Finalize tool summary when a non-tool event arrives
+                        let is_tool_event = matches!(
+                            notification.update,
+                            agent_client_protocol::SessionUpdate::ToolCall(_)
+                                | agent_client_protocol::SessionUpdate::ToolCallUpdate(_)
+                        );
+                        if !is_tool_event {
+                            finalize_tool_summary(
+                                &tool_summaries_clone,
+                                &notification.session_id,
+                                &slack_clone,
                             )
                             .await;
                         }
@@ -262,181 +339,93 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                                     tool_call.tool_call_id, tool_call.title, tool_call.kind
                                 );
 
-                                let tool_call_id = tool_call.tool_call_id.to_string();
+                                // Extract a short tool name from the title
+                                // Titles look like "Tool: Read /path/to/file (edited)"
+                                // We want just "Read", "Grep", "Edit", etc.
+                                let tool_name = extract_tool_name(&tool_call.title);
 
-                                // Check if this is a new tool call or an update, and what needs uploading
-                                let (msg_ts, channel, needs_raw_input_upload, needs_content_upload) = {
-                                    let mut tool_messages = tool_messages_clone.write().await;
-
-                                    if let Some((channel, ts, stored_tool_call)) =
-                                        tool_messages.get_mut(&tool_call_id)
+                                let mut summaries = tool_summaries_clone.write().await;
+                                if let Some(summary) = summaries.get_mut(&notification.session_id) {
+                                    // Update existing summary
+                                    summary.call_count += 1;
+                                    if !summary.tool_names.contains(&tool_name) {
+                                        summary.tool_names.push(tool_name);
+                                    }
+                                    let msg = summary.format_message();
+                                    let _ = slack_clone
+                                        .update_message(&summary.channel, &summary.message_ts, &msg)
+                                        .await;
+                                } else {
+                                    // Create new summary message
+                                    let mut summary = ToolSummary {
+                                        channel: session.channel.clone(),
+                                        thread_key: thread_key.clone(),
+                                        message_ts: String::new(),
+                                        call_count: 1,
+                                        completed_count: 0,
+                                        failed_count: 0,
+                                        tool_names: vec![tool_name],
+                                    };
+                                    let msg = summary.format_message();
+                                    match slack_clone
+                                        .send_message(&session.channel, Some(&thread_key), &msg)
+                                        .await
                                     {
-                                        // Existing tool call - check what changed
-                                        let title_changed =
-                                            tool_call.title != stored_tool_call.title;
-                                        let needs_raw_input =
-                                            tool_call.raw_input != stored_tool_call.raw_input;
-                                        let needs_content =
-                                            tool_call.content != stored_tool_call.content;
-
-                                        // Update message text only if title changed and not empty
-                                        if title_changed && !tool_call.title.is_empty() {
-                                            let msg = format!("🔧 Tool: {}", tool_call.title);
-                                            let _ =
-                                                slack_clone.update_message(channel, ts, &msg).await;
+                                        Ok(ts) => {
+                                            summary.message_ts = ts;
+                                            summaries.insert(
+                                                notification.session_id.clone(),
+                                                summary,
+                                            );
                                         }
-
-                                        // Update stored tool call
-                                        *stored_tool_call = tool_call.clone();
-
-                                        (
-                                            ts.clone(),
-                                            channel.clone(),
-                                            needs_raw_input,
-                                            needs_content,
-                                        )
-                                    } else {
-                                        // New tool call - need to send message and upload everything
-                                        drop(tool_messages);
-                                        let msg = format!("🔧 Tool: {}", tool_call.title);
-                                        match slack_clone
-                                            .send_message(&session.channel, Some(&thread_key), &msg)
-                                            .await
-                                        {
-                                            Ok(ts) => {
-                                                tool_messages_clone.write().await.insert(
-                                                    tool_call_id.clone(),
-                                                    (
-                                                        session.channel.clone(),
-                                                        ts.clone(),
-                                                        tool_call.clone(),
-                                                    ),
-                                                );
-                                                (ts, session.channel.clone(), true, true)
-                                            }
-                                            Err(e) => {
-                                                tracing::error!("Failed to send message: {}", e);
-                                                continue;
-                                            }
+                                        Err(e) => {
+                                            tracing::error!("Failed to send tool summary: {}", e);
                                         }
                                     }
-                                };
-
-                                // Upload files only if they changed
-                                upload_tool_call_files(
-                                    &slack_clone,
-                                    &channel,
-                                    &msg_ts,
-                                    tool_call.raw_input.as_ref(),
-                                    &tool_call.content,
-                                    needs_raw_input_upload,
-                                    needs_content_upload,
-                                )
-                                .await;
+                                }
                             }
                             agent_client_protocol::SessionUpdate::ToolCallUpdate(update) => {
                                 trace!(
-                                    "ToolCallUpdate: id={}, status={:?}, content={:?}",
+                                    "ToolCallUpdate: id={}, status={:?}",
                                     update.tool_call_id,
                                     update.fields.status,
-                                    update.fields.content
                                 );
 
-                                let tool_call_id = update.tool_call_id.to_string();
-
-                                // Get current state and check what needs updating
-                                let (channel, ts, needs_raw_input_upload, needs_content_upload) = {
-                                    let mut tool_messages = tool_messages_clone.write().await;
-
-                                    if let Some((channel, ts, stored_tool_call)) =
-                                        tool_messages.get_mut(&tool_call_id)
-                                    {
-                                        let channel = channel.clone();
-                                        let ts = ts.clone();
-
-                                        // Check if title changed
-                                        if let Some(title) = &update.fields.title {
-                                            if !title.is_empty() && title != &stored_tool_call.title
-                                            {
-                                                let msg = format!("🔧 Tool: {}", title);
-                                                let _ = slack_clone
-                                                    .update_message(&channel, &ts, &msg)
-                                                    .await;
-                                                stored_tool_call.title = title.clone();
-                                            }
-                                        }
-
-                                        let needs_raw_input = update
-                                            .fields
-                                            .raw_input
-                                            .as_ref()
-                                            .map(|raw_input| {
-                                                stored_tool_call.raw_input.as_ref()
-                                                    != Some(raw_input)
-                                            })
-                                            .unwrap_or(false);
-
-                                        let needs_content = update
-                                            .fields
-                                            .content
-                                            .as_ref()
-                                            .map(|content| &stored_tool_call.content != content)
-                                            .unwrap_or(false);
-
-                                        // Update stored values
-                                        if let Some(raw_input) = &update.fields.raw_input {
-                                            if needs_raw_input {
-                                                stored_tool_call.raw_input =
-                                                    Some(raw_input.clone());
-                                            }
-                                        }
-                                        if let Some(content) = &update.fields.content {
-                                            if needs_content {
-                                                stored_tool_call.content = content.clone();
-                                            }
-                                        }
-
-                                        (channel, ts, needs_raw_input, needs_content)
-                                    } else {
-                                        continue;
-                                    }
-                                };
-
-                                // Upload files if needed (without holding lock)
-                                upload_tool_call_files(
-                                    &slack_clone,
-                                    &channel,
-                                    &ts,
-                                    update.fields.raw_input.as_ref(),
-                                    update.fields.content.as_ref().unwrap_or(&vec![]),
-                                    needs_raw_input_upload,
-                                    needs_content_upload,
-                                )
-                                .await;
-
-                                // Update tool call message when status changes to terminal state
+                                // Update summary counts on terminal status
                                 if let Some(status) = update.fields.status {
-                                    if let Some(status_emoji) = match status {
-                                        agent_client_protocol::ToolCallStatus::Completed => {
-                                            Some("✅")
+                                    let mut summaries = tool_summaries_clone.write().await;
+                                    if let Some(summary) =
+                                        summaries.get_mut(&notification.session_id)
+                                    {
+                                        match status {
+                                            agent_client_protocol::ToolCallStatus::Completed => {
+                                                summary.completed_count += 1;
+                                            }
+                                            agent_client_protocol::ToolCallStatus::Failed => {
+                                                summary.failed_count += 1;
+                                            }
+                                            _ => {}
                                         }
-                                        agent_client_protocol::ToolCallStatus::Failed => Some("❌"),
-                                        _ => None,
-                                    } {
-                                        // Remove from tracking and update the Slack message
-                                        if let Some((channel, ts, tool_call)) =
-                                            tool_messages_clone.write().await.remove(&tool_call_id)
-                                        {
-                                            let msg = format!(
-                                                "{} Tool: {}",
-                                                status_emoji, tool_call.title
-                                            );
-
-                                            let _ = slack_clone
-                                                .update_message(&channel, &ts, &msg)
-                                                .await;
-                                        }
+                                        let msg = summary.format_message();
+                                        let _ = slack_clone
+                                            .update_message(
+                                                &summary.channel,
+                                                &summary.message_ts,
+                                                &msg,
+                                            )
+                                            .await;
                                     }
+                                }
+
+                                // Still upload diffs — those are valuable
+                                if let Some(content) = &update.fields.content {
+                                    upload_tool_call_diffs(
+                                        &slack_clone,
+                                        &session.channel,
+                                        &thread_key,
+                                        content,
+                                    )
+                                    .await;
                                 }
                             }
                             _ => {}
@@ -556,86 +545,90 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
     Ok(())
 }
 
-async fn upload_yaml_input(
+/// Extract a short tool name from a tool call title.
+/// Titles look like "Read /path/to/file" or "grep --type=rb ..." — we want just "Read", "grep", etc.
+fn extract_tool_name(title: &str) -> String {
+    // The title typically starts with "Tool: Name ..." or just "Name ..."
+    let title = title.strip_prefix("Tool: ").unwrap_or(title);
+    title
+        .split_whitespace()
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Finalize an active tool summary — update the Slack message to show final state,
+/// then remove it from tracking so the next batch of tool calls gets a fresh summary.
+async fn finalize_tool_summary(
+    summaries: &ToolSummaries,
+    session_id: &SessionId,
     slack: &slack::SlackConnection,
-    channel: &str,
-    thread_ts: &str,
-    raw_input: Option<&serde_json::Value>,
 ) {
-    if let Some(yaml_content) = raw_input.and_then(|v| serde_yaml_ng::to_string(v).ok()) {
-        let trimmed = yaml_content.trim();
-        if !trimmed.is_empty() && trimmed != "{}" {
-            if let Err(e) = slack
-                .upload_file(
-                    channel,
-                    Some(thread_ts),
-                    &yaml_content,
-                    "input.yaml",
-                    Some("Input"),
-                )
-                .await
-            {
-                tracing::error!("Failed to upload YAML file: {}", e);
-            }
-        }
+    if let Some(summary) = summaries.write().await.remove(session_id) {
+        // Force completed state for display
+        let msg = if summary.failed_count > 0 {
+            format!(
+                "⚠️ {} tool call{} ({}) — {} failed",
+                summary.call_count,
+                if summary.call_count != 1 { "s" } else { "" },
+                if summary.tool_names.len() <= 5 {
+                    summary.tool_names.join(", ")
+                } else {
+                    let shown: Vec<_> = summary.tool_names[..4].to_vec();
+                    format!("{}, +{} more", shown.join(", "), summary.tool_names.len() - 4)
+                },
+                summary.failed_count,
+            )
+        } else {
+            format!(
+                "✅ {} tool call{} ({})",
+                summary.call_count,
+                if summary.call_count != 1 { "s" } else { "" },
+                if summary.tool_names.len() <= 5 {
+                    summary.tool_names.join(", ")
+                } else {
+                    let shown: Vec<_> = summary.tool_names[..4].to_vec();
+                    format!("{}, +{} more", shown.join(", "), summary.tool_names.len() - 4)
+                },
+            )
+        };
+        let _ = slack
+            .update_message(&summary.channel, &summary.message_ts, &msg)
+            .await;
     }
 }
 
-async fn upload_tool_call_content(
-    slack: &slack::SlackConnection,
+/// Upload only diff content from tool calls (skips input YAML and text context uploads)
+async fn upload_tool_call_diffs(
+    slack: &Arc<slack::SlackConnection>,
     channel: &str,
     thread_ts: &str,
     content: &[agent_client_protocol::ToolCallContent],
 ) {
     for item in content {
-        match item {
-            agent_client_protocol::ToolCallContent::Diff(diff) => {
-                let diff_text = if let Some(old_text) = &diff.old_text {
-                    generate_unified_diff(old_text, &diff.new_text)
-                } else {
-                    diff.new_text
-                        .lines()
-                        .map(|line| format!("+{}", line))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                let filename = format!(
-                    "{}.diff",
-                    diff.path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("file")
-                );
-                if let Err(e) = slack
-                    .upload_file(
-                        channel,
-                        Some(thread_ts),
-                        &diff_text,
-                        &filename,
-                        Some("Diff"),
-                    )
-                    .await
-                {
-                    tracing::error!("Failed to upload diff file: {}", e);
-                }
+        if let agent_client_protocol::ToolCallContent::Diff(diff) = item {
+            let diff_text = if let Some(old_text) = &diff.old_text {
+                generate_unified_diff(old_text, &diff.new_text)
+            } else {
+                diff.new_text
+                    .lines()
+                    .map(|line| format!("+{}", line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let filename = format!(
+                "{}.diff",
+                diff.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+            );
+            if let Err(e) = slack
+                .upload_file(channel, Some(thread_ts), &diff_text, &filename, Some("Diff"))
+                .await
+            {
+                tracing::error!("Failed to upload diff file: {}", e);
             }
-            agent_client_protocol::ToolCallContent::Content(content) => {
-                if let agent_client_protocol::ContentBlock::Text(text) = &content.content {
-                    if let Err(e) = slack
-                        .upload_file(
-                            channel,
-                            Some(thread_ts),
-                            &text.text,
-                            "context.txt",
-                            Some("Context"),
-                        )
-                        .await
-                    {
-                        tracing::error!("Failed to upload context file: {}", e);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -751,24 +744,6 @@ fn format_plan_message(entries: &[agent_client_protocol::PlanEntry]) -> String {
     }
 
     lines.join("\n")
-}
-
-/// Upload tool call files if they changed
-async fn upload_tool_call_files(
-    slack: &Arc<slack::SlackConnection>,
-    channel: &str,
-    ts: &str,
-    raw_input: Option<&serde_json::Value>,
-    content: &[agent_client_protocol::ToolCallContent],
-    needs_raw_input: bool,
-    needs_content: bool,
-) {
-    if needs_raw_input {
-        upload_yaml_input(slack, channel, ts, raw_input).await;
-    }
-    if needs_content {
-        upload_tool_call_content(slack, channel, ts, content).await;
-    }
 }
 
 async fn send_plan_message(
