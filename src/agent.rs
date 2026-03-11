@@ -34,6 +34,7 @@ pub struct AgentManager {
 /// Permission request from an agent that needs user approval
 pub struct PermissionRequest {
     pub session_id: SessionId,
+    pub tool_call: agent_client_protocol::ToolCallUpdate,
     pub options: Vec<PermissionOption>,
     pub response_tx: oneshot::Sender<Option<String>>,
 }
@@ -485,6 +486,7 @@ impl Client for NotificationClient {
             let (response_tx, response_rx) = oneshot::channel();
             let permission_req = PermissionRequest {
                 session_id: args.session_id.clone(),
+                tool_call: args.tool_call.clone(),
                 options: args.options.clone(),
                 response_tx,
             };
