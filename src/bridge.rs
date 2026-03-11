@@ -16,9 +16,6 @@ pub enum NotificationWrapper {
 /// Shared message buffer for accumulating agent message chunks
 pub type MessageBuffers = Arc<RwLock<HashMap<SessionId, String>>>;
 
-/// Shared thought buffer for accumulating agent thought chunks
-pub type ThoughtBuffers = Arc<RwLock<HashMap<SessionId, String>>>;
-
 /// Tracks a single summary Slack message for all tool calls in a prompt cycle
 struct ToolSummary {
     /// Slack channel
@@ -124,7 +121,6 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
 
     // Create shared message buffers for accumulating chunks
     let message_buffers: MessageBuffers = Arc::new(RwLock::new(HashMap::new()));
-    let thought_buffers: ThoughtBuffers = Arc::new(RwLock::new(HashMap::new()));
 
     // Create shared tool summary tracker (one summary message per session)
     let tool_summaries: ToolSummaries = Arc::new(RwLock::new(HashMap::new()));
@@ -136,7 +132,6 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
     let slack_clone = slack.clone();
     let session_manager_clone = session_manager.clone();
     let buffers_clone = message_buffers.clone();
-    let thought_buffers_clone = thought_buffers.clone();
     let tool_summaries_clone = tool_summaries.clone();
     tokio::spawn(async move {
         debug!("Agent notification handler started");
@@ -157,14 +152,6 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
 
                         flush_message_buffer(
                             &buffers_clone,
-                            &session_id,
-                            &slack_clone,
-                            &session.channel,
-                            &thread_key,
-                        )
-                        .await;
-                        flush_thought_buffer(
-                            &thought_buffers_clone,
                             &session_id,
                             &slack_clone,
                             &session.channel,
@@ -195,20 +182,6 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                         if !is_message_chunk {
                             flush_message_buffer(
                                 &buffers_clone,
-                                &notification.session_id,
-                                &slack_clone,
-                                &session.channel,
-                                &thread_key,
-                            )
-                            .await;
-                        }
-                        let is_thought_chunk = matches!(
-                            notification.update,
-                            agent_client_protocol::SessionUpdate::AgentThoughtChunk(_)
-                        );
-                        if !is_thought_chunk {
-                            flush_thought_buffer(
-                                &thought_buffers_clone,
                                 &notification.session_id,
                                 &slack_clone,
                                 &session.channel,
@@ -284,18 +257,8 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                                     _ => {}
                                 }
                             }
-                            agent_client_protocol::SessionUpdate::AgentThoughtChunk(chunk) => {
-                                if let agent_client_protocol::ContentBlock::Text(text) =
-                                    chunk.content
-                                {
-                                    // Buffer the thought chunk
-                                    thought_buffers_clone
-                                        .write()
-                                        .await
-                                        .entry(notification.session_id.clone())
-                                        .or_insert_with(String::new)
-                                        .push_str(&text.text);
-                                }
+                            agent_client_protocol::SessionUpdate::AgentThoughtChunk(_) => {
+                                // Suppress agent thinking/reasoning — not useful in Slack
                             }
                             agent_client_protocol::SessionUpdate::ConfigOptionUpdate(update) => {
                                 // Update stored config options
@@ -455,6 +418,14 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                 .await;
 
             if let Some((thread_key, session)) = session_info {
+                // Show what tool is requesting permission
+                let tool_title = permission_req
+                    .tool_call
+                    .fields
+                    .title
+                    .as_deref()
+                    .unwrap_or("unknown tool");
+
                 // Format permission options
                 let options_text = permission_req
                     .options
@@ -465,7 +436,8 @@ pub async fn run_bridge(config: Arc<config::Config>) -> Result<()> {
                     .join("\n");
 
                 let msg = format!(
-                    "⚠️ Permission Required\n\n{}\n\nReply with the number to approve, or 'deny' to reject.",
+                    "⚠️ *Permission Required*\n\n`{}`\n\n{}\n\nReply with the number to approve, or 'deny' to reject.",
+                    tool_title,
                     options_text
                 );
 
@@ -655,30 +627,6 @@ async fn flush_message_buffer(
             let _ = slack.send_message(channel, Some(thread_key), &buffer).await;
         }
     }
-}
-
-async fn flush_thought_buffer(
-    buffers: &ThoughtBuffers,
-    session_id: &SessionId,
-    slack: &slack::SlackConnection,
-    channel: &str,
-    thread_key: &str,
-) {
-    if let Some(buffer) = buffers.write().await.remove(session_id) {
-        if !buffer.is_empty() {
-            debug!("Flushing {} chars from thought buffer", buffer.len());
-            let _ = slack
-                .send_message(channel, Some(thread_key), &format_thought_message(&buffer))
-                .await;
-        }
-    }
-}
-
-fn format_thought_message(text: &str) -> String {
-    text.lines()
-        .map(|line| format!("> {}", line))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn build_plan_block_payload(entries: &[agent_client_protocol::PlanEntry]) -> Value {
